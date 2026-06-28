@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"errors"
+
 	"github.com/clinic/appointment/internal/database"
 	"github.com/clinic/appointment/internal/models"
 	"github.com/clinic/appointment/pkg/response"
@@ -45,7 +47,16 @@ func CreateMedicalRecord(c *gin.Context) {
 
 	if appointment.Status != models.AppointmentStatusConfirmed {
 		tx.Rollback()
-		response.BadRequest(c, "Appointment is not confirmed")
+		switch appointment.Status {
+		case models.AppointmentStatusCancelled:
+			response.BadRequest(c, "This appointment has been cancelled")
+		case models.AppointmentStatusExpired:
+			response.BadRequest(c, "This appointment has expired")
+		case models.AppointmentStatusCompleted:
+			response.BadRequest(c, "Medical record already exists for this appointment")
+		default:
+			response.BadRequest(c, "Appointment is not confirmed")
+		}
 		return
 	}
 
@@ -72,10 +83,13 @@ func CreateMedicalRecord(c *gin.Context) {
 		return
 	}
 
-	appointment.Status = models.AppointmentStatusCompleted
-	if err := tx.Save(&appointment).Error; err != nil {
+	if err := CompleteAppointment(tx, req.AppointmentID, "doctor_id = ?", doctor.ID); err != nil {
 		tx.Rollback()
-		response.InternalServerError(c, "Failed to update appointment status: "+err.Error())
+		if errors.Is(err, ErrInvalidTransition) {
+			response.BadRequest(c, "Cannot complete appointment in current status")
+		} else {
+			response.InternalServerError(c, "Failed to complete appointment: "+err.Error())
+		}
 		return
 	}
 

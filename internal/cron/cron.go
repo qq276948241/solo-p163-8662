@@ -6,8 +6,8 @@ import (
 
 	"github.com/clinic/appointment/internal/config"
 	"github.com/clinic/appointment/internal/database"
+	"github.com/clinic/appointment/internal/handlers"
 	"github.com/clinic/appointment/internal/models"
-	"gorm.io/gorm"
 )
 
 func StartExpiredAppointmentCleaner() {
@@ -56,10 +56,23 @@ func cleanExpiredAppointments() {
 
 	log.Printf("Cron: Found %d expired appointments to process", len(expiredAppointments))
 
+	processed := 0
 	for _, appointment := range expiredAppointments {
-		if err := processExpiredAppointment(tx, appointment); err != nil {
-			log.Printf("Cron: Failed to process appointment %d: %v", appointment.ID, err)
+		prevStatus, err := handlers.ExpireAppointment(tx, appointment.ID)
+		if err != nil {
+			log.Printf("Cron: Failed to expire appointment %d: %v", appointment.ID, err)
+			continue
 		}
+
+		var schedule models.Schedule
+		if getErr := tx.First(&schedule, appointment.ScheduleID).Error; getErr == nil {
+			log.Printf("Cron: Appointment %d expired (status: %q→expired), schedule %d count: %d",
+				appointment.ID, prevStatus, schedule.ID, schedule.CurrentCount)
+		} else {
+			log.Printf("Cron: Appointment %d expired (status: %q→expired",
+				appointment.ID, prevStatus)
+		}
+		processed++
 	}
 
 	if err := tx.Commit().Error; err != nil {
@@ -67,33 +80,5 @@ func cleanExpiredAppointments() {
 		return
 	}
 
-	log.Printf("Cron: Successfully processed %d expired appointments", len(expiredAppointments))
-}
-
-func processExpiredAppointment(tx *gorm.DB, appointment models.Appointment) error {
-	appointment.Status = models.AppointmentStatusExpired
-	if err := tx.Save(&appointment).Error; err != nil {
-		return err
-	}
-
-	var schedule models.Schedule
-	if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&schedule, appointment.ScheduleID).Error; err != nil {
-		return err
-	}
-
-	schedule.CurrentCount--
-	if schedule.CurrentCount < 0 {
-		schedule.CurrentCount = 0
-	}
-	if schedule.CurrentCount < schedule.MaxAppointments && schedule.Status == models.ScheduleStatusFull {
-		schedule.Status = models.ScheduleStatusAvailable
-	}
-	if err := tx.Save(&schedule).Error; err != nil {
-		return err
-	}
-
-	log.Printf("Cron: Appointment %d expired, schedule %d count updated to %d",
-		appointment.ID, schedule.ID, schedule.CurrentCount)
-
-	return nil
+	log.Printf("Cron: Successfully processed %d/%d expired appointments", processed, len(expiredAppointments))
 }
