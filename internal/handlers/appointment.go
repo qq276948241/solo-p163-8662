@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/clinic/appointment/internal/config"
@@ -78,16 +79,19 @@ func ReleaseScheduleSlot(tx *gorm.DB, scheduleID uint) (*models.Schedule, error)
 		return nil, err
 	}
 
+	was := schedule.CurrentCount
 	if schedule.CurrentCount > 0 {
 		schedule.CurrentCount--
 	}
-	if schedule.CurrentCount < schedule.MaxAppointments && schedule.Status != models.ScheduleStatusAvailable {
+	if schedule.CurrentCount < schedule.MaxAppointments {
 		schedule.Status = models.ScheduleStatusAvailable
 	}
 
 	if err := tx.Save(&schedule).Error; err != nil {
 		return nil, err
 	}
+	log.Printf("ReleaseScheduleSlot: schedule=%d was_count=%d now_count=%d status=%s",
+		schedule.ID, was, schedule.CurrentCount, schedule.Status)
 	return &schedule, nil
 }
 
@@ -139,6 +143,12 @@ func TransitionAppointmentStatus(
 // ExpireAppointment 过期处理：pending→expired + 释放号源。
 // （cron 调用，返回原状态便于日志）
 func ExpireAppointment(tx *gorm.DB, appointmentID uint) (string, error) {
+	var probe models.Appointment
+	if err := tx.First(&probe, appointmentID).Error; err != nil {
+		return "", err
+	}
+	prevStatus := probe.Status
+
 	appt, changed, err := TransitionAppointmentStatus(
 		tx, appointmentID,
 		[]string{models.AppointmentStatusPending},
@@ -146,20 +156,16 @@ func ExpireAppointment(tx *gorm.DB, appointmentID uint) (string, error) {
 		"",
 	)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", err
-		}
-		return "", err
+		return prevStatus, err
 	}
-	prevStatus := appt.Status
 	if !changed {
 		return prevStatus, nil
 	}
 
 	if _, err := ReleaseScheduleSlot(tx, appt.ScheduleID); err != nil {
-		return "", err
+		return prevStatus, err
 	}
-	return models.AppointmentStatusPending, nil
+	return prevStatus, nil
 }
 
 // CompleteAppointment 完成就诊：confirmed→completed。
@@ -335,33 +341,11 @@ func handleConfirmTransitionError(c *gin.Context, appt *models.Appointment) {
 
 func CancelAppointment(c *gin.Context) {
 	userID := c.GetUint("userID")
-	appointmentID := c.Param("id")
+	appointmentID := parseUintParam(c.Param("id"))
 
 	var patient models.Patient
 	if err := database.DB.Where("user_id = ?", userID).First(&patient).Error; err != nil {
 		response.NotFound(c, "Patient profile not found")
-		return
-	}
-
-	var preCheckAppt models.Appointment
-	if err := database.DB.Where("id = ? AND patient_id = ?", parseUintParam(appointmentID), patient.ID).
-		First(&preCheckAppt).Error; err != nil {
-		response.NotFound(c, "Appointment not found")
-		return
-	}
-	switch preCheckAppt.Status {
-	case models.AppointmentStatusCancelled:
-		response.SuccessWithMessage(c, "Appointment already cancelled, no action needed", nil)
-		return
-	case models.AppointmentStatusExpired:
-		response.SuccessWithMessage(c, "This appointment has expired and been automatically released. The slot is now available", nil)
-		return
-	case models.AppointmentStatusCompleted:
-		response.BadRequest(c, "This appointment has been completed and cannot be cancelled")
-		return
-	case models.AppointmentStatusPending, models.AppointmentStatusConfirmed:
-	default:
-		response.BadRequest(c, "Cannot cancel appointment in current status")
 		return
 	}
 
@@ -377,7 +361,7 @@ func CancelAppointment(c *gin.Context) {
 	}()
 
 	appt, changed, err := TransitionAppointmentStatus(
-		tx, parseUintParam(appointmentID),
+		tx, appointmentID,
 		[]string{models.AppointmentStatusPending, models.AppointmentStatusConfirmed},
 		models.AppointmentStatusCancelled,
 		"patient_id = ?", patient.ID,
@@ -396,7 +380,7 @@ func CancelAppointment(c *gin.Context) {
 	}
 
 	var schedule *models.Schedule
-	if changed {
+	if appt.Status == models.AppointmentStatusCancelled && appt.ScheduleID > 0 {
 		schedule, err = ReleaseScheduleSlot(tx, appt.ScheduleID)
 		if err != nil {
 			tx.Rollback()
@@ -422,6 +406,9 @@ func CancelAppointment(c *gin.Context) {
 		}
 		return
 	}
+
+	log.Printf("CancelAppointment: id=%d status=%s schedule=%d slots_left=%d",
+		appt.ID, appt.Status, schedule.ID, schedule.MaxAppointments-schedule.CurrentCount)
 
 	response.SuccessWithMessage(c, "Appointment cancelled successfully, slot released", gin.H{
 		"appointment_id": appt.ID,
