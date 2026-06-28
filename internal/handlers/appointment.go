@@ -180,44 +180,79 @@ func CancelAppointment(c *gin.Context) {
 		return
 	}
 
+	var appointment models.Appointment
+	if err := database.DB.Where("id = ? AND patient_id = ?", appointmentID, patient.ID).First(&appointment).Error; err != nil {
+		response.NotFound(c, "Appointment not found")
+		return
+	}
+
+	switch appointment.Status {
+	case models.AppointmentStatusCancelled:
+		response.SuccessWithMessage(c, "Appointment already cancelled, no action needed", nil)
+		return
+	case models.AppointmentStatusExpired:
+		response.SuccessWithMessage(c, "This appointment has expired and been automatically released. The slot is now available", nil)
+		return
+	case models.AppointmentStatusCompleted:
+		response.BadRequest(c, "This appointment has been completed and cannot be cancelled")
+		return
+	case models.AppointmentStatusPending, models.AppointmentStatusConfirmed:
+	default:
+		response.BadRequest(c, "Cannot cancel appointment in current status")
+		return
+	}
+
 	tx := database.DB.Begin()
 	if tx.Error != nil {
 		response.InternalServerError(c, "Failed to start transaction")
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
 
-	var appointment models.Appointment
-	if err := tx.Where("id = ? AND patient_id = ?", appointmentID, patient.ID).First(&appointment).Error; err != nil {
+	lockedAppt := models.Appointment{}
+	if err := tx.Set("gorm:query_option", "FOR UPDATE").
+		Where("id = ? AND patient_id = ?", appointmentID, patient.ID).
+		First(&lockedAppt).Error; err != nil {
 		tx.Rollback()
 		response.NotFound(c, "Appointment not found")
 		return
 	}
 
-	if appointment.Status == models.AppointmentStatusCancelled || appointment.Status == models.AppointmentStatusCompleted {
+	if lockedAppt.Status != models.AppointmentStatusPending && lockedAppt.Status != models.AppointmentStatusConfirmed {
 		tx.Rollback()
-		response.BadRequest(c, "Cannot cancel this appointment")
+		switch lockedAppt.Status {
+		case models.AppointmentStatusCancelled:
+			response.SuccessWithMessage(c, "Appointment already cancelled by another request", nil)
+		case models.AppointmentStatusExpired:
+			response.SuccessWithMessage(c, "This appointment has expired and been automatically released. The slot is now available", nil)
+		default:
+			response.BadRequest(c, "Cannot cancel appointment in current status")
+		}
 		return
 	}
 
-	appointment.Status = models.AppointmentStatusCancelled
-	if err := tx.Save(&appointment).Error; err != nil {
+	lockedAppt.Status = models.AppointmentStatusCancelled
+	if err := tx.Save(&lockedAppt).Error; err != nil {
 		tx.Rollback()
 		response.InternalServerError(c, "Failed to cancel appointment: "+err.Error())
 		return
 	}
 
 	var schedule models.Schedule
-	if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&schedule, appointment.ScheduleID).Error; err != nil {
+	if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&schedule, lockedAppt.ScheduleID).Error; err != nil {
 		tx.Rollback()
 		response.InternalServerError(c, "Failed to get schedule: "+err.Error())
 		return
 	}
 
-	schedule.CurrentCount--
-	if schedule.CurrentCount < 0 {
-		schedule.CurrentCount = 0
+	if schedule.CurrentCount > 0 {
+		schedule.CurrentCount--
 	}
-	if schedule.CurrentCount < schedule.MaxAppointments {
+	if schedule.CurrentCount < schedule.MaxAppointments && schedule.Status != models.ScheduleStatusAvailable {
 		schedule.Status = models.ScheduleStatusAvailable
 	}
 	if err := tx.Save(&schedule).Error; err != nil {
@@ -232,7 +267,13 @@ func CancelAppointment(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, nil)
+	response.SuccessWithMessage(c, "Appointment cancelled successfully, slot released", gin.H{
+		"appointment_id": lockedAppt.ID,
+		"appointment_no": lockedAppt.AppointmentNo,
+		"status":         lockedAppt.Status,
+		"schedule_id":    schedule.ID,
+		"slots_left":     schedule.MaxAppointments - schedule.CurrentCount,
+	})
 }
 
 func GetMyAppointments(c *gin.Context) {
